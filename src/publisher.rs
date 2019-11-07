@@ -176,6 +176,7 @@ impl Publisher {
                 match self.create_session_bindings(&session) {
                     Ok(_) => {
                         debug!("Created bindings for session {}", session);
+                        self.stop_consumer("shared");
                         let update = self.get_view_update(session);
                         self.dispatch_message(update, vec![ ("sender_id", &self.inner.id), ("session",session) ]);
                     },
@@ -186,6 +187,12 @@ impl Publisher {
         };
     }
 
+    pub fn stop_consumer(&self, tag: &str) -> Result<(), std::io::Error> {
+        self.inner.chan.basic_cancel(tag, BasicCancelOptions::default()).wait()
+            .map_err(|e| Error::new(ErrorKind::ConnectionReset, e))?;
+        Ok(())
+    }
+
     // Attach consumers to both the shared queue and the session-specific queue.
     pub fn consume(&self) -> Result<(), std::io::Error> {
         let exchange = self.inner.ex.clone();
@@ -193,7 +200,7 @@ impl Publisher {
 
         // Preconfigure delegate to handle session messages.
         let session_opts = BasicConsumeOptions{ no_local: true, no_ack: false, exclusive: true, nowait: false };
-        let session_consumer = chan.basic_consume(&self.inner.session_q, "", session_opts, FieldTable::default()).wait()
+        let session_consumer = chan.basic_consume(&self.inner.session_q, "session", session_opts, FieldTable::default()).wait()
             .map_err(|e| Error::new(ErrorKind::NotConnected, e))?;
 
         session_consumer.set_delegate( Box::new( move | delivery: DeliveryResult | {
@@ -208,7 +215,7 @@ impl Publisher {
         // Then start listening for messages on the shared queue.
         let shared_self = self.clone(); 
         let shared_opts = BasicConsumeOptions{ no_local: true, no_ack: false, exclusive: false, nowait: false };
-        let shared_consumer = self.inner.chan.basic_consume(&self.inner.shared_q, "", shared_opts, FieldTable::default()).wait()
+        let shared_consumer = self.inner.chan.basic_consume(&self.inner.shared_q, "shared", shared_opts, FieldTable::default()).wait()
             .map_err(|e| Error::new(ErrorKind::NotConnected, e))?;
 
         shared_consumer.set_delegate(Box::new(move | delivery: DeliveryResult |{ 
@@ -230,8 +237,8 @@ impl Publisher {
                     };
                     chan.basic_ack(delivery.delivery_tag, BasicAckOptions::default()).wait().expect("ACK failed")
                 }, // Got message
-                Ok(None) =>  warn!("Consumer cancelled"), // Consumer cancelled
-                Err(e) => error!("Consumer error {}", e),
+                Ok(None) => info!("Shared onsumer cancelled"), // Consumer cancelled
+                Err(e) => error!("Shared consumer error {}", e),
             };
         }));
 
