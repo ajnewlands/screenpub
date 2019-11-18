@@ -1,10 +1,13 @@
 use uuid::Uuid;
 use std::{thread, panic};
 use log::{info, warn, error, debug};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::Duration;
 use std::io::{Error, ErrorKind};
 use bytes::Bytes;
+
+use mtpng::encoder::{Encoder, Options};
+use mtpng::{ColorType, CompressionLevel, Header};
 
 use lapin::{
     Channel, Connection, ConnectionProperties, BasicProperties, Queue,
@@ -16,6 +19,10 @@ extern crate flatbuffers;
 #[allow(unused_imports)]
 mod messages_generated;
 use messages_generated::switchboard::*;
+
+#[path="snapscreen/snapscreen.rs"]
+mod snapscreen;
+use snapscreen::Snapper;
 
 mod util;
 use util::string_to_header;
@@ -45,8 +52,8 @@ impl Publisher {
         let shared_q = Publisher::create_queue(chan.clone(), queue )?;
         let session_queue_name = format!("{}.{}", queue, id);
         let session_q = Publisher::create_queue(chan.clone(), &session_queue_name )?;
-        info!("Publisher created with id {}", id);
 
+        info!("Publisher created with id {}", id);
         Publisher::create_shared_bindings(chan.clone(), queue, exchange)?;
 
         return Ok(Publisher{ 
@@ -118,10 +125,24 @@ impl Publisher {
     }
 
     fn get_view_update(&self, session: &str) -> bytes::Bytes {
+        // Get an initial screenshot
+        //let screen = self.inner.snapper.write().unwrap().snap();
+        let mut snapper = Snapper::new();
+        let screen = snapper.snap();
+        let mut writer = Vec::<u8>::new();
+        let mut header = Header::new();
+        header.set_size( ((screen.len() / snapper.height) /4) as u32, snapper.height as u32 );
+        header.set_color( ColorType::TruecolorAlpha, 8).expect("set color died mysteriously");
+        let options = Options::new();
+        let mut encoder = Encoder::new(writer, &options);
+        encoder.write_header(&header).expect("failed writing header");
+        encoder.write_image_rows(&screen).expect("failed writing rows");
+        let png = encoder.finish().unwrap();
+        info!("Encoded screen to size {}", png.len());
+
         let mut builder = flatbuffers::FlatBufferBuilder::new_with_capacity(1024);
-        let update = ViewUpdate::create(&mut builder, &ViewUpdateArgs{
-            ..Default::default()
-        });
+        let data = builder.create_vector_direct(&png);
+        let update = ViewUpdate::create(&mut builder, &ViewUpdateArgs{ data: Some(data), sqn: 0, incremental: false });
         let ses = builder.create_string(session);
 
         let message = Msg::create(&mut builder, &MsgArgs{
@@ -193,13 +214,8 @@ impl Publisher {
                 };
             },
             Content::ViewAck => {
-                match self.create_session_bindings(&session) {
-                    Ok(_) => {
-                        let update = self.get_view_update(session);
-                        self.dispatch_message(update, vec![ ("type", "ViewUpdate"), ("sender_id", &self.inner.id), ("session",session), ("dest_id", dest_id) ]);
-                    },
-                    Err(e) => error!("Unable to create session bindings for session {}: {:?}", session, e),
-                };
+              let update = self.get_view_update(session);
+              self.dispatch_message(update, vec![ ("type", "ViewUpdate"), ("sender_id", &self.inner.id), ("session",session), ("dest_id", dest_id) ]);
             },
             x => warn!("unhandled message type {:?}", x),
         };
