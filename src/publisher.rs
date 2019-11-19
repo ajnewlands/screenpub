@@ -9,11 +9,7 @@ use bytes::Bytes;
 use mtpng::encoder::{Encoder, Options};
 use mtpng::{ColorType, CompressionLevel, Header};
 
-use lapin::{
-    Channel, Connection, ConnectionProperties, BasicProperties, Queue,
-    message::DeliveryResult, types::{FieldTable, ShortString},
-    ExchangeKind, options::*
-};
+use amiquip::{Connection, Publish, ConsumerMessage, ConsumerOptions, QueueDeclareOptions, ExchangeType, ExchangeDeclareOptions, FieldTable, AmqpValue, AmqpProperties, Channel, Queue};
 
 extern crate flatbuffers;
 #[allow(unused_imports)]
@@ -23,9 +19,6 @@ use messages_generated::switchboard::*;
 #[path="snapscreen/snapscreen.rs"]
 mod snapscreen;
 use snapscreen::Snapper;
-
-mod util;
-use util::string_to_header;
 
 // In order to pass state between threaded callbacks, we create a cheaply clonable structure with 
 // an Arc core.
@@ -37,84 +30,51 @@ pub struct Publisher {
 struct Inner {
     id: String,
     chan: Arc<Channel>,
+    conn: Connection,
     ex: String,
-    shared_q: Queue,
-    session_q: Queue,
-    tx: Arc<Mutex<mpsc::Sender<Bytes>>>,
 }
 
 impl Publisher {
-    pub fn new( tx: mpsc::Sender<Bytes>, amqp: String, timeout: u64, exchange: &str, queue: &str) -> Result<Publisher, std::io::Error> {
-        let conn = Publisher::get_connection(amqp, timeout)?;
-        let chan = Arc::new(Publisher::get_channel(&conn)?);
-        let _ = Publisher::create_exchange(chan.clone(), exchange)?;
+    pub fn new( amqp: String, timeout: u64, exchange: &str, queue: &str) -> Result<Publisher, std::io::Error> {
+        let mut conn = Publisher::get_connection(&amqp, timeout)?;
+        let chan = Arc::new(Publisher::get_channel(&mut conn)?);
+        Publisher::declare_exchange(chan.clone(), exchange)?;
         let id =  Uuid::new_v4().to_string();
-        let shared_q = Publisher::create_queue(chan.clone(), queue )?;
-        let session_queue_name = format!("{}.{}", queue, id);
-        let session_q = Publisher::create_queue(chan.clone(), &session_queue_name )?;
 
         info!("Publisher created with id {}", id);
-        Publisher::create_shared_bindings(chan.clone(), queue, exchange)?;
-
         return Ok(Publisher{ 
             inner: Arc::new(Inner{
                 id,
                 chan: chan.clone(),
+                conn,
                 ex: String::from(exchange),
-                shared_q,
-                session_q,
-                tx: Arc::new(Mutex::new(tx)),
             }),
         });
     }
 
     /// Due to apparent deficiencies in Lapin, this won't return early when a connection is rejected.
     /// From experimentation, this seems to only be an issue on Windows (it will return immediately on Linux)
-    fn get_connection(amqp: String, timeout: u64) -> Result<Connection, std::io::Error> {
-        let (sender, receiver) = mpsc::channel();
-        {
-            let _t = thread::spawn(move ||{
-                let conn = Connection::connect(&amqp, ConnectionProperties::default());
-                match conn.wait() {
-                    Ok(conn) => sender.send(conn).unwrap(),
-                    Err(_) => drop(sender),
-                };
-            });
-        }
-
-        return match receiver.recv_timeout(Duration::from_millis(timeout)) {
-            Ok(conn) => Ok(conn),
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, e)), 
-        };
+    fn get_connection(amqp: &str, _timeout: u64) -> Result<Connection, std::io::Error> {
+        let connection = Connection::insecure_open( amqp )
+            .map_err(|e| Error::new(ErrorKind::NotConnected, e))?;
+        Ok(connection)
     }
 
     /// Get a channel for the connection
-    fn get_channel(conn: &Connection) -> Result<Channel, std::io::Error> {
-        return match conn.create_channel().wait() {
-            Ok(ch) => match ch.basic_qos( 30, BasicQosOptions::default()).wait() {
-                    Ok(_) => Ok(ch),
-                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, e)), 
-            },
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, e)),
-        };
+    fn get_channel(conn: &mut Connection) -> Result<Channel, std::io::Error> {
+        let channel = conn.open_channel(None)
+            .map_err(|e| Error::new(ErrorKind::NotConnected, e))?;
+        
+        Ok(channel)
     }
 
     /// Declare the named exchange, creating it if it doesn exist already.
-    fn create_exchange(chan: Arc<Channel>, exchange: &str) -> Result<&str, std::io::Error> {
-        let opts = ExchangeDeclareOptions{ passive:false, durable: false, auto_delete: true, internal:false, nowait:false };
-        return match chan.exchange_declare(exchange , ExchangeKind::Headers, opts, FieldTable::default()).wait() {
-            Ok(_) => Ok(exchange),
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, e)),
-        };
-    }
+    fn declare_exchange(chan: Arc<Channel>, exchange: &str) -> Result<(), std::io::Error> {
+        let opts = ExchangeDeclareOptions{ durable: false, auto_delete: true, internal:false, arguments: FieldTable::default() };
+        chan.exchange_declare(ExchangeType::Headers, exchange, opts )
+            .map_err(|e| Error::new(ErrorKind::NotConnected, e))?;
 
-    /// Declare the named queue (creating it if it doesn't exist)
-    fn create_queue(chan: Arc<Channel>, queue: &str) -> Result<Queue, std::io::Error> {
-        let opts = QueueDeclareOptions{ passive:false, durable:false, exclusive:false, auto_delete:true, nowait:false};
-        return match chan.queue_declare(queue, opts, FieldTable::default()).wait() {
-            Ok(q) => Ok(q),
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, e)),
-        };
+        Ok(()) // what was I thinking?? 
     }
 
     fn create_shared_bindings(chan: Arc<Channel>, queue: &str, exchange: &str) -> Result<(), std::io::Error> {
@@ -133,16 +93,20 @@ impl Publisher {
         let mut header = Header::new();
         header.set_size( ((screen.len() / snapper.height) /4) as u32, snapper.height as u32 );
         header.set_color( ColorType::TruecolorAlpha, 8).expect("set color died mysteriously");
-        let options = Options::new();
+
+        let now = std::time::Instant::now();
+        let mut options = Options::new();
+        options.set_compression_level(CompressionLevel::Fast);
         let mut encoder = Encoder::new(writer, &options);
+
         encoder.write_header(&header).expect("failed writing header");
         encoder.write_image_rows(&screen).expect("failed writing rows");
         let png = encoder.finish().unwrap();
-        info!("Encoded screen to size {}", png.len());
+        info!("Encoded screen to size {} in {}", png.len(), now.elapsed().as_millis());
 
         let mut builder = flatbuffers::FlatBufferBuilder::new_with_capacity(1024);
         let data = builder.create_vector_direct(&png);
-        let update = ViewUpdate::create(&mut builder, &ViewUpdateArgs{ data: Some(data), sqn: 0, incremental: false });
+        let update = ViewUpdate::create(&mut builder, &ViewUpdateArgs{ sqn: 4, incremental: false, data: Some(data) });
         let ses = builder.create_string(session);
 
         let message = Msg::create(&mut builder, &MsgArgs{
@@ -160,25 +124,28 @@ impl Publisher {
 
         for (name, val) in args.iter(){
             debug!("adding header {}, value {}", name, val);
-            headers.insert(ShortString::from(*name), string_to_header(val));
+            headers.insert(String::from(*name), AmqpValue::LongString(String::from(*val)));
         }
 
-        let props = BasicProperties::default().with_headers(headers);
+        let props = AmqpProperties::default().with_headers(headers);
 
-        return self.inner.chan.basic_publish(&self.inner.ex, "", BasicPublishOptions::default(), message.to_vec(), props).wait()
-            .map_err(|e| Error::new(ErrorKind::Other, e));
+        let opts = Publish{ body: &message, routing_key: String::from(""), mandatory: false, immediate: false, properties: props };
+        self.inner.chan.basic_publish(self.inner.ex.clone(), opts);
+
+        Ok(())
     }
 
     fn create_type_binding(chan: Arc<Channel>, queue: &str, exchange: &str, bindings: Vec<(&str, &str)> ) -> Result<(), std::io::Error> {
         let mut fields = FieldTable::default();
 
         for (name, val) in bindings.iter(){
-            fields.insert(ShortString::from(*name), string_to_header(val));
+            fields.insert(String::from(*name), AmqpValue::LongString(String::from(*val)));
         }
 
-        return chan.queue_bind(queue, exchange, "", QueueBindOptions::default(), fields)
-            .wait()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Unable to bind to queue {}: {:?}", queue, e)));
+        chan.queue_bind( queue, exchange, "", fields )
+            .map_err(|e| Error::new(ErrorKind::ConnectionReset, e))?;
+
+        Ok(())
     }
 
     //fn create_session_bindings(chan: Arc<Channel>, queue: &str, exchange: &str, session: &str) -> Result<(), std::io::Error> {
@@ -190,6 +157,7 @@ impl Publisher {
         Ok(())
     }
 
+    /*
     fn handle_message( &self, message: Msg, rabbit_headers: &FieldTable ) {
         let session =  match &(rabbit_headers.inner())["session"]  {
             lapin::types::AMQPValue::LongString(s) => s.as_str(),
@@ -215,18 +183,50 @@ impl Publisher {
             },
             Content::ViewAck => {
               let update = self.get_view_update(session);
+              info!("Received ACK at {}",  (std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_millis()));
               self.dispatch_message(update, vec![ ("type", "ViewUpdate"), ("sender_id", &self.inner.id), ("session",session), ("dest_id", dest_id) ]);
             },
             x => warn!("unhandled message type {:?}", x),
         };
     }
+    */
 
+    /*
     pub fn stop_consumer(&self, tag: &str) -> Result<(), std::io::Error> {
         self.inner.chan.basic_cancel(tag, BasicCancelOptions::default()).wait()
             .map_err(|e| Error::new(ErrorKind::ConnectionReset, e))?;
         Ok(())
     }
+    */
 
+    pub fn consume(&self) -> Result<(), String> {
+        let opts = QueueDeclareOptions{ durable: false, exclusive: false, auto_delete: true, arguments: FieldTable::default() };
+        let chan = self.inner.chan.clone();
+        let queue = chan.queue_declare("publisher", opts)
+            .map_err(|e| format!("Failed to declare queue; {:?}", e))?;
+
+        Publisher::create_shared_bindings(self.inner.chan.clone(), "publisher", &self.inner.ex)
+            .map_err(|e| format!("Failed to create shared bindings; {:?}", e ))?;
+
+        let shared_consumer = queue.consume(ConsumerOptions::default())
+            .map_err(|e| format!("Failed to consume from queue; {:?}", e ))?;
+
+        for (i,message) in shared_consumer.receiver().iter().enumerate() {
+            match message {
+                ConsumerMessage::Delivery(delivery) => {
+                    println!("Got a message at {}", (std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_millis()));
+                },
+                e => {
+                    println!("Consumer ended {:?}", e);
+                    break;
+                },
+            }
+        }
+        println!("Done consuming!");
+
+        Ok(())
+    }
+    /*
     // Attach consumers to both the shared queue and the session-specific queue.
     pub fn consume(&self) -> Result<(), std::io::Error> {
         let exchange = self.inner.ex.clone();
@@ -234,7 +234,7 @@ impl Publisher {
 
         // Preconfigure delegate to handle session messages.
         let session_self = self.clone(); 
-        let session_opts = BasicConsumeOptions{ no_local: true, no_ack: false, exclusive: true, nowait: false };
+        let session_opts = BasicConsumeOptions{ no_local: true, no_ack: false, exclusive: true, nowait: true };
         let session_consumer = chan.basic_consume(&self.inner.session_q, "session", session_opts, FieldTable::default()).wait()
             .map_err(|e| Error::new(ErrorKind::NotConnected, e))?;
 
@@ -260,7 +260,7 @@ impl Publisher {
 
         // Then start listening for messages on the shared queue.
         let shared_self = self.clone(); 
-        let shared_opts = BasicConsumeOptions{ no_local: true, no_ack: false, exclusive: false, nowait: false };
+        let shared_opts = BasicConsumeOptions{ no_local: true, no_ack: false, exclusive: false, nowait: true };
         let shared_consumer = self.inner.chan.basic_consume(&self.inner.shared_q, "shared", shared_opts, FieldTable::default()).wait()
             .map_err(|e| Error::new(ErrorKind::NotConnected, e))?;
         let chan = self.inner.chan.clone();
@@ -286,4 +286,5 @@ impl Publisher {
 
         Ok(())
     }
+    */
 }

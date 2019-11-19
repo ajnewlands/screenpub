@@ -25,7 +25,6 @@ impl Snapper {
         let width = capturer.width();
         let height = capturer.height();
 
-        println!("Got display handle with dimensions: {} x {}", width, height);
         Snapper{
             capturer,
             width,

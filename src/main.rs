@@ -1,6 +1,7 @@
 use log::{info, error};
 use std::thread;
-use std::sync::{Arc, Mutex, Condvar, mpsc};
+use std::thread::JoinHandle;
+use std::sync::{Mutex, Condvar, mpsc};
 use bytes::Bytes;
 
 mod publisher;
@@ -12,38 +13,31 @@ fn main() -> std::io::Result<()> {
     };
     env_logger::init();
 
-    let amqp = std::env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://127.0.0.1:5672/%2f".into());
+    let amqp = std::env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://guest:guest@127.0.0.1:5672".into());
     let timeout: u64 = 5000;
-    let (tx, rx): (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) = mpsc::channel();
-
+    let mut threads = Vec::<JoinHandle<_>>::new();
     for thread in 0..5 {
-        let tx = tx.clone();
         let thread_name = format!("publisher-{}", (thread+1));
         let amqp = amqp.clone();
         let timeout = timeout.clone();
 
         let t = thread::Builder::new().name( thread_name ).spawn( move|| {
             info!("started {}", thread::current().name().unwrap_or_else(||"anonymous thread") );
-
-            match publisher::Publisher::new(tx, amqp, timeout, "switchboard", "publisher") {
-                Ok(publisher) => publisher.consume(),
-                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+            let publisher = publisher::Publisher::new(amqp, timeout, "switchboard", "publisher").unwrap();
+            match publisher.consume() {
+                Err(e) => error!("Consumer error: {:?}", e),
+                _ => (),
             };
         });
 
         match t {
-            Ok(_) => (),
+            Ok(thr) => threads.push(thr),
             Err(e) => error!("Failed to launch thread: {:?}", e),
         };
     }
-    drop (tx); // drop the original sender.
 
-    // Accept messages from any remaining children; exit when all supervised threads are gone.
-    loop {
-        match rx.recv() {
-            Ok(msg) => info!("Supervisor received channel message.."),
-            Err(_) => break,
-        };
+    for thread in threads {
+        thread.join();
     }
 
     Ok(())
