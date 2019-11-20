@@ -24,7 +24,7 @@ fn main() -> std::io::Result<()> {
         let t = thread::Builder::new().name( thread_name ).spawn( move|| {
             info!("started {}", thread::current().name().unwrap_or_else(||"anonymous thread") );
             let publisher = publisher::Publisher::new(amqp, timeout, "switchboard", "publisher").unwrap();
-            match publisher.consume() {
+            match publisher.consume_shared() {
                 Err(e) => error!("Consumer error: {:?}", e),
                 _ => (),
             };

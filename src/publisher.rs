@@ -11,6 +11,7 @@ use mtpng::{ColorType, CompressionLevel, Header};
 use amiquip::{Connection, Publish, ConsumerMessage, ConsumerOptions, QueueDeclareOptions, ExchangeType, ExchangeDeclareOptions, FieldTable, AmqpValue, AmqpProperties, Channel };
 
 extern crate flatbuffers;
+use flatbuffers::FlatBufferBuilder;
 #[allow(unused_imports)]
 mod messages_generated;
 use messages_generated::switchboard::*;
@@ -76,10 +77,9 @@ impl Publisher {
         Ok(())
     }
 
-    fn get_view_update(&self, session: &str) -> bytes::Bytes {
+    fn get_view_update(&self, session: &str, snapper: &mut Snapper, mut builder: &mut FlatBufferBuilder) -> bytes::Bytes {
         // Get an initial screenshot
         //let screen = self.inner.snapper.write().unwrap().snap();
-        let mut snapper = Snapper::new();
         let screen = snapper.snap();
         let mut writer = Vec::<u8>::new();
         let mut header = Header::new();
@@ -96,7 +96,6 @@ impl Publisher {
         let png = encoder.finish().unwrap();
         info!("Encoded screen to size {} in {}", png.len(), now.elapsed().as_millis());
 
-        let mut builder = flatbuffers::FlatBufferBuilder::new_with_capacity(1024);
         let data = builder.create_vector_direct(&png);
         let update = ViewUpdate::create(&mut builder, &ViewUpdateArgs{ sqn: 4, incremental: false, data: Some(data) });
         let ses = builder.create_string(session);
@@ -140,7 +139,7 @@ impl Publisher {
         Ok(())
     }
 
-    fn consume_session(&self, session: &str) -> Result<(), String> {
+    fn consume_session(&self, session: &str, dest_id: &str) -> Result<(), String> {
         let session_queue = format!("publisher.{}", self.id);
         let opts = QueueDeclareOptions{ durable: false, exclusive: true, auto_delete: true, arguments: FieldTable::default() };
 
@@ -150,70 +149,75 @@ impl Publisher {
         self.create_type_binding(&session_queue.clone(), vec![ ("session", session), ("type","ViewAck")] )?;
         self.create_type_binding(&session_queue, vec![ ("session", session), ("type", "ViewEnd")] )?;
 
+        let consumer = queue.consume(ConsumerOptions::default())
+            .map_err(|e| format!("Failed to consume from queue; {:?}", e ))?;
+
+        // BEWARE scrap on windows can only exist in one thread at a time. It's broken!
+        let mut snapper = Snapper::new();
+        let mut builder = FlatBufferBuilder::new();
+        let update = self.get_view_update(&session, &mut snapper, &mut builder);
+        self.dispatch_message(update, vec![ ("type", "ViewUpdate"), ("sender_id", &self.id), ("session", &session), ("dest_id", &dest_id) ]);
+
+        for message in consumer.receiver().iter() {
+            match message {
+                ConsumerMessage::Delivery(delivery) => {
+                    match delivery.properties.headers().as_ref() {
+                        None => error!("Rabbit message received without headers"),
+                        Some(headers) => {
+                            consumer.ack(delivery.clone())
+                                .map_err(|e| format!("Rabbit rejected an ack: {:?}", e))?;
+
+                            match panic::catch_unwind(|| get_root_as_msg(&delivery.body)) {
+                                Ok(msg) => {
+                                    match msg.content_type() {
+                                        Content::ViewAck => {
+                                            debug!("Sending update for session {}", session);
+                                            let update = self.get_view_update(&session, &mut snapper, &mut builder);
+                                            self.dispatch_message(update, vec![ ("type", "ViewUpdate"), ("sender_id", &self.id), ("session", &session), ("dest_id", &dest_id) ]);
+                                        },
+                                        Content::ViewEnd => warn!("Got a ViewEnd (which is unimplemented!)"),
+                                        t =>  warn!("Dropping unhandled message type {:?}", t),
+                                    };
+                                },
+                                Err(_) => error!("Dropping invalid message"),
+                            };
+                        },
+                    };
+                },
+                e => {
+                    debug!("Consumer ended in thread {}: {:?}", self.id, e);
+                    break;
+                },
+            }
+        }
+
         Ok(())
     }
 
-    /*
-    fn handle_message( &self, message: Msg, rabbit_headers: &FieldTable ) {
-        let session =  match &(rabbit_headers.inner())["session"]  {
-            lapin::types::AMQPValue::LongString(s) => s.as_str(),
-            _ => "",
-        };
-        let dest_id =  match &(rabbit_headers.inner())["sender_id"]  {
-            lapin::types::AMQPValue::LongString(s) => s.as_str(),
-            _ => "",
-        };
+    fn get_header_str( header: &str, headers: &FieldTable ) -> Result<String, String> {
+        if let AmqpValue::LongString(session) = &headers[header] {
+            return Ok(String::from(session));
+        }
+        else {
+            return Err( format!("Discarding message without {} header", header));
+        }
+    }
 
-        debug!("got a message of type {:?} for session {}", message.content_type(), session);
+    fn handle_view_start(&self, message: &Msg, headers: &FieldTable) -> Result<(), String> {
         match message.content_type() {
             Content::ViewStart => {
-                match self.create_session_bindings(&session) {
-                    Ok(_) => {
-                        debug!("Created bindings for session {}", session);
-                        self.stop_consumer("shared");
-                        let update = self.get_view_update(session);
-                        self.dispatch_message(update, vec![ ("type", "ViewUpdate"), ("sender_id", &self.inner.id), ("session",session), ("dest_id", dest_id) ]);
-                    },
-                    Err(e) => error!("Unable to create session bindings for session {}: {:?}", session, e),
-                };
+                let session = Publisher::get_header_str("session", headers)?;
+                info!("Starting view updates for session {}", session);
+                let dest_id = Publisher::get_header_str("sender_id", headers)?;
+                self.consume_session(&session, &dest_id)?;
             },
-            Content::ViewAck => {
-              let update = self.get_view_update(session);
-              info!("Received ACK at {}",  (std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_millis()));
-              self.dispatch_message(update, vec![ ("type", "ViewUpdate"), ("sender_id", &self.inner.id), ("session",session), ("dest_id", dest_id) ]);
-            },
-            x => warn!("unhandled message type {:?}", x),
-        };
-    }
-    */
-
-    /*
-    pub fn stop_consumer(&self, tag: &str) -> Result<(), std::io::Error> {
-        self.inner.chan.basic_cancel(tag, BasicCancelOptions::default()).wait()
-            .map_err(|e| Error::new(ErrorKind::ConnectionReset, e))?;
-        Ok(())
-    }
-    */
-
-    fn handle_message(&self, message: &Msg, headers: &FieldTable) -> Result<(), String> {
-        match message.content_type() {
-            Content::ViewStart => {
-                if let AmqpValue::LongString(session) = &headers["session"] {
-                    info!("Starting screen updates for session {}", session);
-                    self.consume_session(&session)?;
-                }
-                else {
-                    return Err( String::from("Dropping ViewStart without session header"));
-                }
-
-            },
-            t => warn!("Discarding unhandled message type {:?}", t),
+            t => warn!("Expected ViewStart but got {:?}", t),
         };
 
         Ok(())
     }
 
-    pub fn consume(&self) -> Result<(), String> {
+    pub fn consume_shared(&self) -> Result<(), String> {
         let opts = QueueDeclareOptions{ durable: false, exclusive: false, auto_delete: true, arguments: FieldTable::default() };
         let chan = self.chan.clone();
         let queue = chan.queue_declare(self.queue.clone(), opts)
@@ -236,11 +240,15 @@ impl Publisher {
 
                             match panic::catch_unwind(|| get_root_as_msg(&delivery.body)) {
                                 Ok(msg) => {
-                                    if (msg.content_type() == Content::ViewStart) {
-                                        shared_consumer.cancel();
-                                    }
                                     debug!("Got a '{:?}' message at {}", msg.content_type(), (std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_millis()));
-                                    self.handle_message( &msg, headers )?;
+                                    match msg.content_type() {
+                                        Content::ViewStart => {
+                                            shared_consumer.cancel();
+                                            self.handle_view_start(&msg, headers)?;
+                                        },
+                                        t => warn!("Dropping unhandled message type {:?}", t),
+                                    }
+
                                 },
                                 Err(_) => error!("Dropping invalid message"),
                             };
@@ -256,65 +264,4 @@ impl Publisher {
 
         Ok(())
     }
-    /*
-    // Attach consumers to both the shared queue and the session-specific queue.
-    pub fn consume(&self) -> Result<(), std::io::Error> {
-        let exchange = self.inner.ex.clone();
-        let chan = self.inner.chan.clone();
-
-        // Preconfigure delegate to handle session messages.
-        let session_self = self.clone(); 
-        let session_opts = BasicConsumeOptions{ no_local: true, no_ack: false, exclusive: true, nowait: true };
-        let self.session_consumer = chan.basic_consume(&self.inner.session_q, "session", session_opts, FieldTable::default()).wait()
-            .map_err(|e| Error::new(ErrorKind::NotConnected, e))?;
-
-        session_consumer.set_delegate( Box::new( move | delivery: DeliveryResult | {
-            match delivery {
-                Ok(Some(delivery)) => {
-                    // reading the flatbuffer will panic if it is invalid; catch_unwind will
-                    // prevent the program from summarily aborting.
-                    match delivery.properties.headers().as_ref() {
-                        None => error!("Received message has no headers"), // should be impossible, given our bindings
-                        Some(headers) => match panic::catch_unwind(|| get_root_as_msg(&delivery.data)) {
-                            Ok(msg) => session_self.handle_message(msg, headers),
-                            Err(_) => error!("Dropping invalid message"),
-                        }
-                    }
-                    chan.basic_ack(delivery.delivery_tag, BasicAckOptions::default()).wait().expect("ACK failed")
-                },
-                Ok(None) => warn!("Session consumer cancelled"),
-                Err(e) => error!("Consumer error {}", e),
-            };
-        }));
-        
-
-        // Then start listening for messages on the shared queue.
-        let shared_self = self.clone(); 
-        let shared_opts = BasicConsumeOptions{ no_local: true, no_ack: false, exclusive: false, nowait: true };
-        let shared_consumer = self.inner.chan.basic_consume(&self.inner.shared_q, "shared", shared_opts, FieldTable::default()).wait()
-            .map_err(|e| Error::new(ErrorKind::NotConnected, e))?;
-        let chan = self.inner.chan.clone();
-
-        shared_consumer.set_delegate(Box::new(move | delivery: DeliveryResult |{ 
-            match delivery {
-                Ok(Some(delivery)) => {
-                    // reading the flatbuffer will panic if it is invalid; catch_unwind will
-                    // prevent the program from summarily aborting.
-                    match delivery.properties.headers().as_ref() {
-                        None => error!("Received message has no headers"), // should be impossible, given our bindings
-                        Some(headers) => match panic::catch_unwind(|| get_root_as_msg(&delivery.data)) {
-                            Ok(msg) => shared_self.handle_message(msg, headers),
-                            Err(_) => error!("Dropping invalid message"),
-                        }
-                    }
-                    chan.basic_ack(delivery.delivery_tag, BasicAckOptions::default()).wait().expect("ACK failed")
-                }, 
-                Ok(None) => info!("Shared consumer cancelled for {}", shared_self.inner.id), // Consumer cancelled
-                Err(e) => error!("Shared consumer error {}", e),
-            };
-        }));
-
-        Ok(())
-    }
-    */
 }
