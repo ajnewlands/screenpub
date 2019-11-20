@@ -1,15 +1,14 @@
 use uuid::Uuid;
-use std::{thread, panic};
+use std::panic;
 use log::{info, warn, error, debug};
-use std::sync::{Arc, Mutex, RwLock, mpsc};
-use std::time::Duration;
+use std::rc::Rc;
+use std::cell::RefCell;
 use std::io::{Error, ErrorKind};
-use bytes::Bytes;
 
 use mtpng::encoder::{Encoder, Options};
 use mtpng::{ColorType, CompressionLevel, Header};
 
-use amiquip::{Connection, Publish, ConsumerMessage, ConsumerOptions, QueueDeclareOptions, ExchangeType, ExchangeDeclareOptions, FieldTable, AmqpValue, AmqpProperties, Channel, Queue};
+use amiquip::{Connection, Publish, ConsumerMessage, ConsumerOptions, QueueDeclareOptions, ExchangeType, ExchangeDeclareOptions, FieldTable, AmqpValue, AmqpProperties, Channel };
 
 extern crate flatbuffers;
 #[allow(unused_imports)]
@@ -20,35 +19,28 @@ use messages_generated::switchboard::*;
 mod snapscreen;
 use snapscreen::Snapper;
 
-// In order to pass state between threaded callbacks, we create a cheaply clonable structure with 
-// an Arc core.
-#[derive(Clone)]
 pub struct Publisher {
-    inner: Arc<Inner>,
-}
-
-struct Inner {
     id: String,
-    chan: Arc<Channel>,
-    conn: Connection,
+    chan: Rc<Channel>,
+    _conn: Rc<RefCell<Connection>>, // hold a reference so it is not dropped prematurely.
     ex: String,
+    queue: String,
 }
 
 impl Publisher {
     pub fn new( amqp: String, timeout: u64, exchange: &str, queue: &str) -> Result<Publisher, std::io::Error> {
-        let mut conn = Publisher::get_connection(&amqp, timeout)?;
-        let chan = Arc::new(Publisher::get_channel(&mut conn)?);
+        let conn = Rc::new(RefCell::new(Publisher::get_connection(&amqp, timeout)?));
+        let chan = Rc::new(Publisher::get_channel( &mut conn.borrow_mut() )?);
         Publisher::declare_exchange(chan.clone(), exchange)?;
         let id =  Uuid::new_v4().to_string();
 
         info!("Publisher created with id {}", id);
         return Ok(Publisher{ 
-            inner: Arc::new(Inner{
-                id,
-                chan: chan.clone(),
-                conn,
-                ex: String::from(exchange),
-            }),
+            id,
+            chan: chan.clone(),
+            _conn: conn.clone(),
+            ex: String::from(exchange),
+            queue: String::from(queue),
         });
     }
 
@@ -69,7 +61,7 @@ impl Publisher {
     }
 
     /// Declare the named exchange, creating it if it doesn exist already.
-    fn declare_exchange(chan: Arc<Channel>, exchange: &str) -> Result<(), std::io::Error> {
+    fn declare_exchange(chan: Rc<Channel>, exchange: &str) -> Result<(), std::io::Error> {
         let opts = ExchangeDeclareOptions{ durable: false, auto_delete: true, internal:false, arguments: FieldTable::default() };
         chan.exchange_declare(ExchangeType::Headers, exchange, opts )
             .map_err(|e| Error::new(ErrorKind::NotConnected, e))?;
@@ -77,9 +69,9 @@ impl Publisher {
         Ok(()) // what was I thinking?? 
     }
 
-    fn create_shared_bindings(chan: Arc<Channel>, queue: &str, exchange: &str) -> Result<(), std::io::Error> {
+    fn create_shared_bindings(&self) -> Result<(), String> {
         let bindings = vec![ ("type", "ViewStart") ];
-        Publisher::create_type_binding(chan.clone(), queue, exchange, bindings)?;
+        self.create_type_binding(&self.queue, bindings)?;
 
         Ok(())
     }
@@ -130,29 +122,33 @@ impl Publisher {
         let props = AmqpProperties::default().with_headers(headers);
 
         let opts = Publish{ body: &message, routing_key: String::from(""), mandatory: false, immediate: false, properties: props };
-        self.inner.chan.basic_publish(self.inner.ex.clone(), opts);
+        self.chan.basic_publish(self.ex.clone(), opts);
 
         Ok(())
     }
 
-    fn create_type_binding(chan: Arc<Channel>, queue: &str, exchange: &str, bindings: Vec<(&str, &str)> ) -> Result<(), std::io::Error> {
+    fn create_type_binding(&self, queue: &str, bindings: Vec<(&str, &str)> ) -> Result<(), String> {
         let mut fields = FieldTable::default();
 
         for (name, val) in bindings.iter(){
             fields.insert(String::from(*name), AmqpValue::LongString(String::from(*val)));
         }
 
-        chan.queue_bind( queue, exchange, "", fields )
-            .map_err(|e| Error::new(ErrorKind::ConnectionReset, e))?;
+        self.chan.queue_bind( queue, &self.ex, "", fields )
+            .map_err(|e| format!("Could not bind queue: {:?}", e))?;
 
         Ok(())
     }
 
-    //fn create_session_bindings(chan: Arc<Channel>, queue: &str, exchange: &str, session: &str) -> Result<(), std::io::Error> {
-    fn create_session_bindings(&self, session: &str) -> Result<(), std::io::Error> {
-        let session_queue_name = format!("publisher.{}", self.inner.id);
-        Publisher::create_type_binding(self.inner.chan.clone(), &session_queue_name.clone(), &self.inner.ex, vec![ ("session", session), ("type","ViewAck")] )?;
-        Publisher::create_type_binding(self.inner.chan.clone(), &session_queue_name.clone(), &self.inner.ex, vec![ ("session", session), ("type", "ViewEnd")] )?;
+    fn consume_session(&self, session: &str) -> Result<(), String> {
+        let session_queue = format!("publisher.{}", self.id);
+        let opts = QueueDeclareOptions{ durable: false, exclusive: true, auto_delete: true, arguments: FieldTable::default() };
+
+        let queue = self.chan.queue_declare(session_queue.clone(), opts)
+            .map_err(|e| format!("Failed to declare queue; {:?}", e))?;
+
+        self.create_type_binding(&session_queue.clone(), vec![ ("session", session), ("type","ViewAck")] )?;
+        self.create_type_binding(&session_queue, vec![ ("session", session), ("type", "ViewEnd")] )?;
 
         Ok(())
     }
@@ -199,30 +195,64 @@ impl Publisher {
     }
     */
 
+    fn handle_message(&self, message: &Msg, headers: &FieldTable) -> Result<(), String> {
+        match message.content_type() {
+            Content::ViewStart => {
+                if let AmqpValue::LongString(session) = &headers["session"] {
+                    info!("Starting screen updates for session {}", session);
+                    self.consume_session(&session)?;
+                }
+                else {
+                    return Err( String::from("Dropping ViewStart without session header"));
+                }
+
+            },
+            t => warn!("Discarding unhandled message type {:?}", t),
+        };
+
+        Ok(())
+    }
+
     pub fn consume(&self) -> Result<(), String> {
         let opts = QueueDeclareOptions{ durable: false, exclusive: false, auto_delete: true, arguments: FieldTable::default() };
-        let chan = self.inner.chan.clone();
-        let queue = chan.queue_declare("publisher", opts)
+        let chan = self.chan.clone();
+        let queue = chan.queue_declare(self.queue.clone(), opts)
             .map_err(|e| format!("Failed to declare queue; {:?}", e))?;
 
-        Publisher::create_shared_bindings(self.inner.chan.clone(), "publisher", &self.inner.ex)
+        self.create_shared_bindings()
             .map_err(|e| format!("Failed to create shared bindings; {:?}", e ))?;
 
         let shared_consumer = queue.consume(ConsumerOptions::default())
             .map_err(|e| format!("Failed to consume from queue; {:?}", e ))?;
 
-        for (i,message) in shared_consumer.receiver().iter().enumerate() {
+        for message in shared_consumer.receiver().iter() {
             match message {
                 ConsumerMessage::Delivery(delivery) => {
-                    println!("Got a message at {}", (std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_millis()));
+                    match delivery.properties.headers().as_ref() {
+                        None => error!("Rabbit message received without headers"),
+                        Some(headers) => {
+                            shared_consumer.ack(delivery.clone())
+                                .map_err(|e| format!("Rabbit rejected an ack: {:?}", e))?;
+
+                            match panic::catch_unwind(|| get_root_as_msg(&delivery.body)) {
+                                Ok(msg) => {
+                                    if (msg.content_type() == Content::ViewStart) {
+                                        shared_consumer.cancel();
+                                    }
+                                    debug!("Got a '{:?}' message at {}", msg.content_type(), (std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_millis()));
+                                    self.handle_message( &msg, headers )?;
+                                },
+                                Err(_) => error!("Dropping invalid message"),
+                            };
+                        },
+                    };
                 },
                 e => {
-                    println!("Consumer ended {:?}", e);
+                    debug!("Consumer ended in thread {}: {:?}", self.id, e);
                     break;
                 },
             }
         }
-        println!("Done consuming!");
 
         Ok(())
     }
@@ -235,7 +265,7 @@ impl Publisher {
         // Preconfigure delegate to handle session messages.
         let session_self = self.clone(); 
         let session_opts = BasicConsumeOptions{ no_local: true, no_ack: false, exclusive: true, nowait: true };
-        let session_consumer = chan.basic_consume(&self.inner.session_q, "session", session_opts, FieldTable::default()).wait()
+        let self.session_consumer = chan.basic_consume(&self.inner.session_q, "session", session_opts, FieldTable::default()).wait()
             .map_err(|e| Error::new(ErrorKind::NotConnected, e))?;
 
         session_consumer.set_delegate( Box::new( move | delivery: DeliveryResult | {
