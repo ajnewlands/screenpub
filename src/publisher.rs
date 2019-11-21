@@ -79,7 +79,6 @@ impl Publisher {
 
     fn get_view_update(&self, session: &str, snapper: &mut Snapper, mut builder: &mut FlatBufferBuilder) -> bytes::Bytes {
         // Get an initial screenshot
-        //let screen = self.inner.snapper.write().unwrap().snap();
         let screen = snapper.snap();
         let mut writer = Vec::<u8>::new();
         let mut header = Header::new();
@@ -94,7 +93,7 @@ impl Publisher {
         encoder.write_header(&header).expect("failed writing header");
         encoder.write_image_rows(&screen).expect("failed writing rows");
         let png = encoder.finish().unwrap();
-        info!("Encoded screen to size {} in {}", png.len(), now.elapsed().as_millis());
+        debug!("Encoded screen to size {} in {}", png.len(), now.elapsed().as_millis());
 
         let data = builder.create_vector_direct(&png);
         let update = ViewUpdate::create(&mut builder, &ViewUpdateArgs{ sqn: 4, incremental: false, data: Some(data) });
@@ -106,8 +105,10 @@ impl Publisher {
             content: Some(update.as_union_value()),
         });
         builder.finish(message, None);
+        let bytes = bytes::Bytes::from(builder.finished_data());
+        builder.reset();
 
-        return bytes::Bytes::from(builder.finished_data());
+        return bytes;
     }
 
     fn dispatch_message(&self, message: bytes::Bytes, args: Vec<(&str, &str)>) -> Result<(), Error> {
@@ -175,7 +176,10 @@ impl Publisher {
                                             let update = self.get_view_update(&session, &mut snapper, &mut builder);
                                             self.dispatch_message(update, vec![ ("type", "ViewUpdate"), ("sender_id", &self.id), ("session", &session), ("dest_id", &dest_id) ]);
                                         },
-                                        Content::ViewEnd => warn!("Got a ViewEnd (which is unimplemented!)"),
+                                        Content::ViewEnd => {
+                                            warn!("Got a ViewEnd - dropping session");
+                                            consumer.cancel();
+                                        },
                                         t =>  warn!("Dropping unhandled message type {:?}", t),
                                     };
                                 },
@@ -190,6 +194,8 @@ impl Publisher {
                 },
             }
         }
+        drop(snapper);
+        self.consume_shared();
 
         Ok(())
     }
@@ -197,8 +203,7 @@ impl Publisher {
     fn get_header_str( header: &str, headers: &FieldTable ) -> Result<String, String> {
         if let AmqpValue::LongString(session) = &headers[header] {
             return Ok(String::from(session));
-        }
-        else {
+        } else {
             return Err( format!("Discarding message without {} header", header));
         }
     }

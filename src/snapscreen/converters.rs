@@ -29,6 +29,7 @@ pub unsafe fn avx2_bgra_to_rgba(offset: isize, bgra: &Vec<u8>, rgba: &mut Vec<u8
     let p_shuffle: *const __m256i = SHUFFLE.as_ptr() as *const __m256i;
     let p_bgra: *const __m256i = bgra.as_ptr().offset(offset) as *const  __m256i;
     let prgba: *mut __m256i = rgba.as_mut_ptr().offset(offset) as *mut __m256i;
+    *prgba = _mm256_shuffle_epi8(*p_bgra, *p_shuffle);
 }
 
 #[target_feature(enable="avx2")]
