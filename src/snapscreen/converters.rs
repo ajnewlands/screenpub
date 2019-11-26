@@ -1,4 +1,4 @@
-use std::arch::x86_64::{ __m256i, _mm256_shuffle_epi8, __m128i, _mm_shuffle_epi8, _mm256_cmpeq_epi64, _mm256_movemask_epi8};
+use std::arch::x86_64::{ __m256i, _mm256_shuffle_epi8, __m128i, _mm_shuffle_epi8, _mm256_cmpeq_epi64, _mm256_movemask_epi8, _mm256_xor_si256 };
 
 pub fn naive_bgra_to_rgba(offset: usize, bgra: &Vec<u8>, rgba: &mut Vec<u8>) {
     rgba[offset] = bgra[offset+2];
@@ -46,8 +46,36 @@ pub unsafe fn avx2_cmp( offset: isize, a: &Vec<u8>, b: &Vec<u8>) -> bool {
 }
 
 
+// After running this function
+// (1) old will then contain the "newest" screen in rgba format
+// (2) new will be replaced with the deltas (old xor new) in rgba format
+#[target_feature(enable="avx2")]
+pub unsafe fn avx2_convert_with_deltas( offset: isize, new: &mut Vec<u8>, old: &mut Vec<u8>) -> bool {
+    const SHUFFLE: [i8; 32] = [2, 1, 0, 3, 6, 5, 4,7,
+                                10, 9, 8, 11, 14, 13, 12, 15,
+                                18, 17, 16, 19, 22, 21, 20, 23,
+                                26, 25, 24, 27, 30, 29, 28, 31];
+
+    let p_shuffle: *const __m256i = SHUFFLE.as_ptr() as *const __m256i;
+    let p_new: *mut __m256i = new.as_mut_ptr().offset(offset) as *mut  __m256i;
+    let p_old: *mut __m256i = old.as_mut_ptr().offset(offset) as *mut __m256i;
+    // convert BGRA to RGBA
+    let rgba = _mm256_shuffle_epi8(*p_new, *p_shuffle);
+    // compare old with new
+    let mask = _mm256_movemask_epi8( _mm256_cmpeq_epi64(*p_new, rgba) );
+    // new = new xor old
+    *p_new = _mm256_xor_si256(*p_old, rgba);
+    *p_old = rgba;
+
+    // Did these buffers differ
+    return match mask as u32 {
+        0xffffffff => true,
+        _ => false,
+    };
+}
+
 // if new != old, convert replace old with new, converting from bgra to rgba and return false.
-// if new == old, return true (and leave old in an indeterminate state)
+// if new == old, return true (new will still contain the converted pixels).
 #[target_feature(enable="avx2")]
 pub unsafe fn avx2_cmp_and_convert( offset: isize, new: &Vec<u8>, old: &mut Vec<u8> ) -> bool {
     const SHUFFLE: [i8; 32] = [2, 1, 0, 3,
@@ -61,10 +89,11 @@ pub unsafe fn avx2_cmp_and_convert( offset: isize, new: &Vec<u8>, old: &mut Vec<
     let p_shuffle: *const __m256i = SHUFFLE.as_ptr() as *const __m256i;
     let p_new: *const __m256i = new.as_ptr().offset(offset) as *const  __m256i;
     let p_old: *mut __m256i = old.as_mut_ptr().offset(offset) as *mut __m256i;
+    let rgba = _mm256_shuffle_epi8(*p_new, *p_shuffle);
     // compare
-    let mask = _mm256_movemask_epi8( _mm256_cmpeq_epi64(*p_new, *p_old) );
+    let mask = _mm256_movemask_epi8( _mm256_cmpeq_epi64(rgba, *p_old) );
     //convert
-    *p_old = _mm256_shuffle_epi8(*p_new, *p_shuffle);
+    *p_old = rgba;
 
     return match mask as u32 {
         0xffffffff => true,

@@ -90,6 +90,66 @@ pub fn enum_name_content(e: Content) -> &'static str {
 }
 
 pub struct ContentUnionTableOffset {}
+#[allow(non_camel_case_types)]
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Capability {
+  FullScreen = 0,
+  BitwiseIncremental = 1,
+
+}
+
+const ENUM_MIN_CAPABILITY: u32 = 0;
+const ENUM_MAX_CAPABILITY: u32 = 1;
+
+impl<'a> flatbuffers::Follow<'a> for Capability {
+  type Inner = Self;
+  #[inline]
+  fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    flatbuffers::read_scalar_at::<Self>(buf, loc)
+  }
+}
+
+impl flatbuffers::EndianScalar for Capability {
+  #[inline]
+  fn to_little_endian(self) -> Self {
+    let n = u32::to_le(self as u32);
+    let p = &n as *const u32 as *const Capability;
+    unsafe { *p }
+  }
+  #[inline]
+  fn from_little_endian(self) -> Self {
+    let n = u32::from_le(self as u32);
+    let p = &n as *const u32 as *const Capability;
+    unsafe { *p }
+  }
+}
+
+impl flatbuffers::Push for Capability {
+    type Output = Capability;
+    #[inline]
+    fn push(&self, dst: &mut [u8], _rest: &[u8]) {
+        flatbuffers::emplace_scalar::<Capability>(dst, *self);
+    }
+}
+
+#[allow(non_camel_case_types)]
+const ENUM_VALUES_CAPABILITY:[Capability; 2] = [
+  Capability::FullScreen,
+  Capability::BitwiseIncremental
+];
+
+#[allow(non_camel_case_types)]
+const ENUM_NAMES_CAPABILITY:[&'static str; 2] = [
+    "FullScreen",
+    "BitwiseIncremental"
+];
+
+pub fn enum_name_capability(e: Capability) -> &'static str {
+  let index = e as u32;
+  ENUM_NAMES_CAPABILITY[index as usize]
+}
+
 pub enum BroadcastOffset {}
 #[derive(Copy, Clone, Debug, PartialEq)]
 
