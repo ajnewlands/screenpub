@@ -68,14 +68,14 @@ impl Snapper {
             panic!("Called for a hextile update but the previous framebuffer length {} does not match current {}", self.last.len(), bgra.len());
         }
         
-        let tile = Vec::with_capacity( 64 * 64 );
+        let mut tile = Vec::with_capacity( 16 * 16 * 4 ); // TODO CONST
 
         for x in (0..bytes_per_row).step_by(64) { // N.B. IA64 prefetch size is 64 bytes
-            for y in (0..self.height).step_by(64) { // define a 16px x 16px (or less at the edges) tile.
+            for y in (0..self.height).step_by(16) { // define a 16px x 16px (or less at the edges) tile.
                 let mut unchanged = true;
                 // test along the horizontal plane first to match the L1 prefetch.
                 // AVX2 version doing 256 bits at a time
-                for row in (0..8) {
+                for row in (0..16) {
                     unsafe { 
                         let left = (( (y + row) * bytes_per_row) + x) as isize;
                         unchanged = avx2_cmp_and_convert( left, &bgra, &mut self.last ) && unchanged; 
@@ -84,7 +84,12 @@ impl Snapper {
                     }
                 }
                 if !unchanged {
-                    tiles.push(Hextile{ x: (x/4) as u16, y: y as u16, tile: tile.clone() });
+                    for row in (0..16) {
+                        let offset =  ((y + row) * bytes_per_row) + x;
+                        tile.extend( &self.last[offset..(offset + 64)] );
+                    }
+                    tiles.push(Hextile{ x: (x/64) as u16, y: (y/16) as u16, tile: tile.clone() });
+                    tile.clear();
                 }
             }
         }
@@ -101,7 +106,7 @@ impl Snapper {
         loop {
             match self.capturer.frame() {
                 Ok(buf) => {
-                    let mut bgra = buf.to_vec();
+                    let bgra = buf.to_vec();
                     self.last = Vec::with_capacity(buf.len());
 
                     unsafe {

@@ -123,6 +123,7 @@ impl Publisher {
 
         let mut vtiles = Vec::<flatbuffers::WIPOffset<Tile>>::with_capacity(hextiles.len());
         for hex in &hextiles {
+            println!("vector length is {}", hex.tile.len());
             let data = builder.create_vector_direct(&hex.tile);
             vtiles.push( Tile::create(&mut builder, &TileArgs{x: hex.x, y: hex.y, data: Some(data) } ));
         }
