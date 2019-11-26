@@ -97,7 +97,7 @@ impl Snapper {
     }
 
     // Populate last, no matter what may have been there before
-    pub fn snap(&mut self) {
+    pub fn snap(&mut self) -> Vec<u8> {
         loop {
             match self.capturer.frame() {
                 Ok(buf) => {
@@ -119,7 +119,7 @@ impl Snapper {
                 },
             };
         }
-
+        return self.last.clone();
     }
 
     /*

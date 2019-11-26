@@ -441,6 +441,106 @@ impl<'a: 'b, 'b> ViewAckBuilder<'a, 'b> {
   }
 }
 
+pub enum TileOffset {}
+#[derive(Copy, Clone, Debug, PartialEq)]
+
+pub struct Tile<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for Tile<'a> {
+    type Inner = Tile<'a>;
+    #[inline]
+    fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+        Self {
+            _tab: flatbuffers::Table { buf: buf, loc: loc },
+        }
+    }
+}
+
+impl<'a> Tile<'a> {
+    #[inline]
+    pub fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+        Tile {
+            _tab: table,
+        }
+    }
+    #[allow(unused_mut)]
+    pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+        _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+        args: &'args TileArgs<'args>) -> flatbuffers::WIPOffset<Tile<'bldr>> {
+      let mut builder = TileBuilder::new(_fbb);
+      if let Some(x) = args.data { builder.add_data(x); }
+      builder.add_y(args.y);
+      builder.add_x(args.x);
+      builder.finish()
+    }
+
+    pub const VT_X: flatbuffers::VOffsetT = 4;
+    pub const VT_Y: flatbuffers::VOffsetT = 6;
+    pub const VT_DATA: flatbuffers::VOffsetT = 8;
+
+  #[inline]
+  pub fn x(&self) -> u16 {
+    self._tab.get::<u16>(Tile::VT_X, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn y(&self) -> u16 {
+    self._tab.get::<u16>(Tile::VT_Y, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn data(&self) -> Option<&'a [u8]> {
+    self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(Tile::VT_DATA, None).map(|v| v.safe_slice())
+  }
+}
+
+pub struct TileArgs<'a> {
+    pub x: u16,
+    pub y: u16,
+    pub data: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a ,  u8>>>,
+}
+impl<'a> Default for TileArgs<'a> {
+    #[inline]
+    fn default() -> Self {
+        TileArgs {
+            x: 0,
+            y: 0,
+            data: None,
+        }
+    }
+}
+pub struct TileBuilder<'a: 'b, 'b> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b> TileBuilder<'a, 'b> {
+  #[inline]
+  pub fn add_x(&mut self, x: u16) {
+    self.fbb_.push_slot::<u16>(Tile::VT_X, x, 0);
+  }
+  #[inline]
+  pub fn add_y(&mut self, y: u16) {
+    self.fbb_.push_slot::<u16>(Tile::VT_Y, y, 0);
+  }
+  #[inline]
+  pub fn add_data(&mut self, data: flatbuffers::WIPOffset<flatbuffers::Vector<'b , u8>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Tile::VT_DATA, data);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> TileBuilder<'a, 'b> {
+    let start = _fbb.start_table();
+    TileBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<Tile<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
 pub enum ViewUpdateOffset {}
 #[derive(Copy, Clone, Debug, PartialEq)]
 
@@ -470,6 +570,7 @@ impl<'a> ViewUpdate<'a> {
         _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
         args: &'args ViewUpdateArgs<'args>) -> flatbuffers::WIPOffset<ViewUpdate<'bldr>> {
       let mut builder = ViewUpdateBuilder::new(_fbb);
+      if let Some(x) = args.tiles { builder.add_tiles(x); }
       if let Some(x) = args.data { builder.add_data(x); }
       builder.add_sqn(args.sqn);
       builder.add_incremental(args.incremental);
@@ -479,6 +580,7 @@ impl<'a> ViewUpdate<'a> {
     pub const VT_SQN: flatbuffers::VOffsetT = 4;
     pub const VT_INCREMENTAL: flatbuffers::VOffsetT = 6;
     pub const VT_DATA: flatbuffers::VOffsetT = 8;
+    pub const VT_TILES: flatbuffers::VOffsetT = 10;
 
   #[inline]
   pub fn sqn(&self) -> u32 {
@@ -492,12 +594,17 @@ impl<'a> ViewUpdate<'a> {
   pub fn data(&self) -> Option<&'a [u8]> {
     self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(ViewUpdate::VT_DATA, None).map(|v| v.safe_slice())
   }
+  #[inline]
+  pub fn tiles(&self) -> Option<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Tile<'a>>>> {
+    self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<flatbuffers::ForwardsUOffset<Tile<'a>>>>>(ViewUpdate::VT_TILES, None)
+  }
 }
 
 pub struct ViewUpdateArgs<'a> {
     pub sqn: u32,
     pub incremental: bool,
     pub data: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a ,  u8>>>,
+    pub tiles: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a , flatbuffers::ForwardsUOffset<Tile<'a >>>>>,
 }
 impl<'a> Default for ViewUpdateArgs<'a> {
     #[inline]
@@ -506,6 +613,7 @@ impl<'a> Default for ViewUpdateArgs<'a> {
             sqn: 0,
             incremental: true,
             data: None,
+            tiles: None,
         }
     }
 }
@@ -525,6 +633,10 @@ impl<'a: 'b, 'b> ViewUpdateBuilder<'a, 'b> {
   #[inline]
   pub fn add_data(&mut self, data: flatbuffers::WIPOffset<flatbuffers::Vector<'b , u8>>) {
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ViewUpdate::VT_DATA, data);
+  }
+  #[inline]
+  pub fn add_tiles(&mut self, tiles: flatbuffers::WIPOffset<flatbuffers::Vector<'b , flatbuffers::ForwardsUOffset<Tile<'b >>>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ViewUpdate::VT_TILES, tiles);
   }
   #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a>) -> ViewUpdateBuilder<'a, 'b> {

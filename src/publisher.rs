@@ -77,10 +77,16 @@ impl Publisher {
         Ok(())
     }
 
-    fn get_view_update(&self, session: &str, snapper: &mut Snapper, mut builder: &mut FlatBufferBuilder) -> bytes::Bytes {
-        // Get an initial screenshot
+    fn get_view_update(&self, session: &str, snapper: &mut Snapper, mut builder: &mut FlatBufferBuilder, incremental: bool) -> bytes::Bytes {
+        return match incremental {
+            true => self.get_incremental_view_update(session, snapper, builder),
+            false => self.get_full_view_update(session, snapper, builder),
+        };
+    }
+
+    fn get_full_view_update(&self, session: &str, snapper: &mut Snapper, mut builder: &mut FlatBufferBuilder) -> bytes::Bytes {
         let screen = snapper.snap();
-        let mut writer = Vec::<u8>::new();
+        let writer = Vec::<u8>::new();
         let mut header = Header::new();
         header.set_size( ((screen.len() / snapper.height) /4) as u32, snapper.height as u32 );
         header.set_color( ColorType::TruecolorAlpha, 8).expect("set color died mysteriously");
@@ -96,7 +102,7 @@ impl Publisher {
         debug!("Encoded screen to size {} in {}", png.len(), now.elapsed().as_millis());
 
         let data = builder.create_vector_direct(&png);
-        let update = ViewUpdate::create(&mut builder, &ViewUpdateArgs{ sqn: 4, incremental: false, data: Some(data) });
+        let update = ViewUpdate::create(&mut builder, &ViewUpdateArgs{ sqn: 0, incremental: false, data: Some(data), tiles: None });
         let ses = builder.create_string(session);
 
         let message = Msg::create(&mut builder, &MsgArgs{
@@ -104,6 +110,34 @@ impl Publisher {
             session: Some(ses),
             content: Some(update.as_union_value()),
         });
+
+        builder.finish(message, None);
+        let bytes = bytes::Bytes::from(builder.finished_data());
+        builder.reset();
+
+        return bytes;
+    }
+
+    fn get_incremental_view_update(&self, session: &str, snapper: &mut Snapper, mut builder: &mut FlatBufferBuilder) -> bytes::Bytes {
+        let hextiles = snapper.snap_hextile();
+
+        let mut vtiles = Vec::<flatbuffers::WIPOffset<Tile>>::with_capacity(hextiles.len());
+        for hex in &hextiles {
+            let data = builder.create_vector_direct(&hex.tile);
+            vtiles.push( Tile::create(&mut builder, &TileArgs{x: hex.x, y: hex.y, data: Some(data) } ));
+        }
+        let tiles = builder.create_vector(&vtiles);
+
+        info!("Incremental update with {} changed tiles", hextiles.len());
+        let update = ViewUpdate::create(&mut builder, &ViewUpdateArgs{ sqn: 0, incremental: true, data: None, tiles: Some(tiles) });
+        let ses = builder.create_string(session);
+
+        let message = Msg::create(&mut builder, &MsgArgs{
+            content_type: Content::ViewUpdate,
+            session: Some(ses),
+            content: Some(update.as_union_value()),
+        });
+
         builder.finish(message, None);
         let bytes = bytes::Bytes::from(builder.finished_data());
         builder.reset();
@@ -140,7 +174,7 @@ impl Publisher {
         Ok(())
     }
 
-    fn consume_session(&self, session: &str, dest_id: &str) -> Result<(), String> {
+    fn consume_session(&self, session: &str, dest_id: &str, incremental: bool) -> Result<(), String> {
         let session_queue = format!("publisher.{}", self.id);
         let opts = QueueDeclareOptions{ durable: false, exclusive: true, auto_delete: true, arguments: FieldTable::default() };
 
@@ -156,7 +190,7 @@ impl Publisher {
         // BEWARE scrap on windows can only exist in one thread at a time. It's broken!
         let mut snapper = Snapper::new();
         let mut builder = FlatBufferBuilder::new();
-        let update = self.get_view_update(&session, &mut snapper, &mut builder);
+        let update = self.get_view_update(&session, &mut snapper, &mut builder, false);
         self.dispatch_message(update, vec![ ("type", "ViewUpdate"), ("sender_id", &self.id), ("session", &session), ("dest_id", &dest_id) ]);
 
         for message in consumer.receiver().iter() {
@@ -173,7 +207,7 @@ impl Publisher {
                                     match msg.content_type() {
                                         Content::ViewAck => {
                                             debug!("Sending update for session {}", session);
-                                            let update = self.get_view_update(&session, &mut snapper, &mut builder);
+                                            let update = self.get_view_update(&session, &mut snapper, &mut builder, incremental );
                                             self.dispatch_message(update, vec![ ("type", "ViewUpdate"), ("sender_id", &self.id), ("session", &session), ("dest_id", &dest_id) ]);
                                         },
                                         Content::ViewEnd => {
@@ -214,7 +248,11 @@ impl Publisher {
                 let session = Publisher::get_header_str("session", headers)?;
                 info!("Starting view updates for session {}", session);
                 let dest_id = Publisher::get_header_str("sender_id", headers)?;
-                self.consume_session(&session, &dest_id)?;
+                let incremental = match message.content_as_view_start().unwrap().capabilities() {
+                    0 => false,
+                    _ => true,
+                }; // rethink this? should the ACK specify the next mode?
+                self.consume_session(&session, &dest_id, incremental)?;
             },
             t => warn!("Expected ViewStart but got {:?}", t),
         };
