@@ -36,17 +36,15 @@ impl Publisher {
         let id =  Uuid::new_v4().to_string();
 
         info!("Publisher created with id {}", id);
-        return Ok(Publisher{ 
+        Ok(Publisher{ 
             id,
             chan: chan.clone(),
             _conn: conn.clone(),
             ex: String::from(exchange),
             queue: String::from(queue),
-        });
+        })
     }
 
-    /// Due to apparent deficiencies in Lapin, this won't return early when a connection is rejected.
-    /// From experimentation, this seems to only be an issue on Windows (it will return immediately on Linux)
     fn get_connection(amqp: &str, _timeout: u64) -> Result<Connection, std::io::Error> {
         let connection = Connection::insecure_open( amqp )
             .map_err(|e| Error::new(ErrorKind::NotConnected, e))?;
@@ -77,7 +75,7 @@ impl Publisher {
         Ok(())
     }
 
-    fn get_view_update(&self, session: &str, snapper: &mut Snapper, mut builder: &mut FlatBufferBuilder, incremental: bool) -> bytes::Bytes {
+    fn get_view_update(&self, session: &str, snapper: &mut Snapper, builder: &mut FlatBufferBuilder, incremental: bool) -> bytes::Bytes {
         return match incremental {
             true => self.get_incremental_view_update(session, snapper, builder),
             false => self.get_full_view_update(session, snapper, builder),
@@ -92,21 +90,19 @@ impl Publisher {
         header.set_color( ColorType::TruecolorAlpha, 8).expect("set color died mysteriously");
         
         let mut options = Options::new();
-        options.set_compression_level(CompressionLevel::Fast);
+        // fast gets a huge speedup in some bad cases and minimally impacts common cases.
+        options.set_compression_level(CompressionLevel::Fast); 
         let mut encoder = Encoder::new(writer, &options);
 
         encoder.write_header(&header).expect("failed writing header");
         encoder.write_image_rows(&pixels).expect("failed writing rows");
 
-        return encoder.finish().unwrap();
+        encoder.finish().unwrap()
     }
 
     fn get_full_view_update(&self, session: &str, snapper: &mut Snapper, mut builder: &mut FlatBufferBuilder) -> bytes::Bytes {
         let screen = snapper.snap();
-        let now = std::time::Instant::now();
         let png = self.compress_rgba(&screen, ((screen.len() / snapper.height) / 4) as u32, snapper.height as u32);
-
-        debug!("Encoded screen to size {} in {}", png.len(), now.elapsed().as_millis());
 
         let data = builder.create_vector_direct(&png);
         let update = ViewUpdate::create(&mut builder, &ViewUpdateArgs{ sqn: 0, incremental: false, data: Some(data), tiles: None });
@@ -122,20 +118,24 @@ impl Publisher {
         let bytes = bytes::Bytes::from(builder.finished_data());
         builder.reset();
 
-        return bytes;
+        bytes
     }
 
     fn get_incremental_view_update(&self, session: &str, snapper: &mut Snapper, mut builder: &mut FlatBufferBuilder) -> bytes::Bytes {
-        let bigtiles = snapper.snap_bigtiles();
+        let mut bigtiles = Vec::<snapscreen::Bigtile>::new();
+        while bigtiles.len() == 0 {
+            bigtiles = snapper.snap_bigtiles();
+        }
+
 
         let mut vtiles = Vec::<flatbuffers::WIPOffset<Tile>>::with_capacity(bigtiles.len());
         for t in &bigtiles {
-            let data = builder.create_vector_direct(&t.tile);
+            let png = self.compress_rgba(&t.tile, t.w.into(), t.h.into());
+            let data = builder.create_vector_direct(&png);
             vtiles.push( Tile::create(&mut builder, &TileArgs{x: t.x, y: t.y, w: t.w, h: t.h, data: Some(data) } ));
         }
         let tiles = builder.create_vector(&vtiles);
 
-        info!("Incremental update with {} changed tiles", bigtiles.len());
         let update = ViewUpdate::create(&mut builder, &ViewUpdateArgs{ sqn: 0, incremental: true, data: None, tiles: Some(tiles) });
         let ses = builder.create_string(session);
 
@@ -149,7 +149,7 @@ impl Publisher {
         let bytes = bytes::Bytes::from(builder.finished_data());
         builder.reset();
 
-        return bytes;
+        bytes
     }
 
     fn dispatch_message(&self, message: bytes::Bytes, args: Vec<(&str, &str)>) -> Result<(), Error> {
