@@ -471,6 +471,8 @@ impl<'a> Tile<'a> {
         args: &'args TileArgs<'args>) -> flatbuffers::WIPOffset<Tile<'bldr>> {
       let mut builder = TileBuilder::new(_fbb);
       if let Some(x) = args.data { builder.add_data(x); }
+      builder.add_h(args.h);
+      builder.add_w(args.w);
       builder.add_y(args.y);
       builder.add_x(args.x);
       builder.finish()
@@ -478,7 +480,9 @@ impl<'a> Tile<'a> {
 
     pub const VT_X: flatbuffers::VOffsetT = 4;
     pub const VT_Y: flatbuffers::VOffsetT = 6;
-    pub const VT_DATA: flatbuffers::VOffsetT = 8;
+    pub const VT_W: flatbuffers::VOffsetT = 8;
+    pub const VT_H: flatbuffers::VOffsetT = 10;
+    pub const VT_DATA: flatbuffers::VOffsetT = 12;
 
   #[inline]
   pub fn x(&self) -> u16 {
@@ -489,6 +493,14 @@ impl<'a> Tile<'a> {
     self._tab.get::<u16>(Tile::VT_Y, Some(0)).unwrap()
   }
   #[inline]
+  pub fn w(&self) -> u16 {
+    self._tab.get::<u16>(Tile::VT_W, Some(0)).unwrap()
+  }
+  #[inline]
+  pub fn h(&self) -> u16 {
+    self._tab.get::<u16>(Tile::VT_H, Some(0)).unwrap()
+  }
+  #[inline]
   pub fn data(&self) -> Option<&'a [u8]> {
     self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(Tile::VT_DATA, None).map(|v| v.safe_slice())
   }
@@ -497,6 +509,8 @@ impl<'a> Tile<'a> {
 pub struct TileArgs<'a> {
     pub x: u16,
     pub y: u16,
+    pub w: u16,
+    pub h: u16,
     pub data: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a ,  u8>>>,
 }
 impl<'a> Default for TileArgs<'a> {
@@ -505,6 +519,8 @@ impl<'a> Default for TileArgs<'a> {
         TileArgs {
             x: 0,
             y: 0,
+            w: 0,
+            h: 0,
             data: None,
         }
     }
@@ -521,6 +537,14 @@ impl<'a: 'b, 'b> TileBuilder<'a, 'b> {
   #[inline]
   pub fn add_y(&mut self, y: u16) {
     self.fbb_.push_slot::<u16>(Tile::VT_Y, y, 0);
+  }
+  #[inline]
+  pub fn add_w(&mut self, w: u16) {
+    self.fbb_.push_slot::<u16>(Tile::VT_W, w, 0);
+  }
+  #[inline]
+  pub fn add_h(&mut self, h: u16) {
+    self.fbb_.push_slot::<u16>(Tile::VT_H, h, 0);
   }
   #[inline]
   pub fn add_data(&mut self, data: flatbuffers::WIPOffset<flatbuffers::Vector<'b , u8>>) {

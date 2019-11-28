@@ -32,6 +32,19 @@ pub unsafe fn avx2_bgra_to_rgba(offset: isize, bgra: &Vec<u8>, rgba: &mut Vec<u8
     *prgba = _mm256_shuffle_epi8(*p_bgra, *p_shuffle);
 }
 
+
+#[target_feature(enable="avx2")]
+pub unsafe fn avx2_convert_in_place(offset: isize, pixels: &mut Vec<u8>) {
+    const SHUFFLE: [i8; 32] = [2, 1, 0, 3, 6, 5, 4,7,
+                                10, 9, 8, 11, 14, 13, 12, 15,
+                                18, 17, 16, 19, 22, 21, 20, 23,
+                                26, 25, 24, 27, 30, 29, 28, 31];
+
+    let p_shuffle: *const __m256i = SHUFFLE.as_ptr() as *const __m256i;
+    let p_pix: *mut __m256i = pixels.as_ptr().offset(offset) as *mut  __m256i;
+    *p_pix = _mm256_shuffle_epi8(*p_pix, *p_shuffle);
+}
+
 #[target_feature(enable="avx2")]
 pub unsafe fn avx2_cmp( offset: isize, a: &Vec<u8>, b: &Vec<u8>) -> bool {
     let p_a: *const __m256i = a.as_ptr().offset(offset) as *const __m256i; 

@@ -1,8 +1,6 @@
 use log::{info, error};
 use std::thread;
 use std::thread::JoinHandle;
-use std::sync::{Mutex, Condvar, mpsc};
-use bytes::Bytes;
 
 mod publisher;
 

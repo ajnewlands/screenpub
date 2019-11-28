@@ -84,21 +84,28 @@ impl Publisher {
         };
     }
 
-    fn get_full_view_update(&self, session: &str, snapper: &mut Snapper, mut builder: &mut FlatBufferBuilder) -> bytes::Bytes {
-        let screen = snapper.snap();
-        let writer = Vec::<u8>::new();
+    fn compress_rgba(&self, pixels: &Vec<u8>, width: u32, height: u32) -> Vec<u8> {
         let mut header = Header::new();
-        header.set_size( ((screen.len() / snapper.height) /4) as u32, snapper.height as u32 );
-        header.set_color( ColorType::TruecolorAlpha, 8).expect("set color died mysteriously");
+        let writer = Vec::<u8>::new();
 
-        let now = std::time::Instant::now();
+        header.set_size( width,  height );
+        header.set_color( ColorType::TruecolorAlpha, 8).expect("set color died mysteriously");
+        
         let mut options = Options::new();
         options.set_compression_level(CompressionLevel::Fast);
         let mut encoder = Encoder::new(writer, &options);
 
         encoder.write_header(&header).expect("failed writing header");
-        encoder.write_image_rows(&screen).expect("failed writing rows");
-        let png = encoder.finish().unwrap();
+        encoder.write_image_rows(&pixels).expect("failed writing rows");
+
+        return encoder.finish().unwrap();
+    }
+
+    fn get_full_view_update(&self, session: &str, snapper: &mut Snapper, mut builder: &mut FlatBufferBuilder) -> bytes::Bytes {
+        let screen = snapper.snap();
+        let now = std::time::Instant::now();
+        let png = self.compress_rgba(&screen, ((screen.len() / snapper.height) / 4) as u32, snapper.height as u32);
+
         debug!("Encoded screen to size {} in {}", png.len(), now.elapsed().as_millis());
 
         let data = builder.create_vector_direct(&png);
@@ -119,16 +126,16 @@ impl Publisher {
     }
 
     fn get_incremental_view_update(&self, session: &str, snapper: &mut Snapper, mut builder: &mut FlatBufferBuilder) -> bytes::Bytes {
-        let hextiles = snapper.snap_hextile();
+        let bigtiles = snapper.snap_bigtiles();
 
-        let mut vtiles = Vec::<flatbuffers::WIPOffset<Tile>>::with_capacity(hextiles.len());
-        for hex in &hextiles {
-            let data = builder.create_vector_direct(&hex.tile);
-            vtiles.push( Tile::create(&mut builder, &TileArgs{x: hex.x, y: hex.y, data: Some(data) } ));
+        let mut vtiles = Vec::<flatbuffers::WIPOffset<Tile>>::with_capacity(bigtiles.len());
+        for t in &bigtiles {
+            let data = builder.create_vector_direct(&t.tile);
+            vtiles.push( Tile::create(&mut builder, &TileArgs{x: t.x, y: t.y, w: t.w, h: t.h, data: Some(data) } ));
         }
         let tiles = builder.create_vector(&vtiles);
 
-        info!("Incremental update with {} changed tiles", hextiles.len());
+        info!("Incremental update with {} changed tiles", bigtiles.len());
         let update = ViewUpdate::create(&mut builder, &ViewUpdateArgs{ sqn: 0, incremental: true, data: None, tiles: Some(tiles) });
         let ses = builder.create_string(session);
 
