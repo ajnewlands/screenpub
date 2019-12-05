@@ -6,6 +6,13 @@ use log::debug;
 mod converters;
 use converters::{ avx2_bgra_to_rgba, avx2_cmp_and_convert, avx2_cmp, avx2_convert_in_place };
 
+#[derive(PartialEq, Eq, Debug)]
+enum RegionType {
+    Unknown = 0,
+    Similarity = 1,
+    Difference = 2,
+}
+
 pub struct Bigtile {
     pub x: u16,
     pub y: u16,
@@ -98,9 +105,75 @@ impl Snapper {
 
         let now = std::time::Instant::now();
         // start splitting the regions horizontally
-        tiles.append( &mut self.split_h(&pixels, bytes_per_row as i32, 0, 0, bytes_per_row as i32, self.height as i32) );
+        //tiles.append( &mut self.split_h(&pixels, bytes_per_row as i32, 0, 0, bytes_per_row as i32, self.height as i32) );
+        tiles.append( &mut self.son_of_krunch(&pixels, bytes_per_row as i32, 0, 0, bytes_per_row as i32, self.height as i32) );
+        println!("done krunching");
         self.last = pixels.clone();
         debug!("tiling took {} ms", now.elapsed().as_millis());
+
+        tiles
+    }
+
+    // attempt at an O(n) split algorithm
+    fn son_of_krunch(&mut self, data: &Vec<u8>, bytes_per_row: i32, startx: i32, starty: i32, endx: i32, endy: i32) -> Vec<Bigtile> {
+        println!("Invoked with sx {}, sy {}, ex {}, ey {}", startx, starty, endx, endy);
+        let mut tiles = Vec::<Bigtile>::new();
+        let mut region_type = RegionType::Unknown;
+
+        for y in (starty..endy).step_by(16) { // define a 16px x 16px (or less at the edges) tile.
+            for x in (startx .. endx).step_by(64) { // 16 px X 4 channel RGBA
+                let mut identical = true; // start by assuming this tile is identical between screens
+                for row in 0..16 {
+                    unsafe { 
+                        let left = (( (y + row) * bytes_per_row) + x) as isize;
+                        identical = avx2_cmp( left, &data, &mut self.last ) && identical; 
+                        let right = (( (y + row) * bytes_per_row) + x + 32) as isize;
+                        identical = avx2_cmp( right, &data, &mut self.last ) && identical; 
+                    }
+                }
+                // the first tile determines whether we will extract a region of similarity or
+                // difference.
+                if region_type == RegionType::Unknown{
+                    region_type = match identical {
+                        true => RegionType::Similarity,
+                        false => RegionType::Difference,
+                    };
+                } else if (region_type == RegionType::Difference) && identical {
+                    println!("Run of differences ended @ {}, {} when searching {}, {} to {}, {}", x, y, startx, starty, endx, endy);
+                    // End of a region of difference: send everything above the current row
+                    if(y-16 > starty) {
+                        println!("bigtiling sx {}, sy {}, ex {}, ey {}", startx, starty, endx, y-16);
+                        tiles.push( Bigtile::from_image(&data, bytes_per_row, startx, starty, endx, y-16));
+                    }
+
+                    // (2) search the region to the right from the current row
+                    //println!("right side will be {}, {} to {}, {}", x, y, endx, endy);
+                    tiles.append( &mut self.son_of_krunch(data, bytes_per_row, x, y, endx, endy));
+
+                    // (3) search the region to the left on the current row
+                    if x-64 > startx {
+                        //println!("left side will be {}, {} to {}, {}", startx, y, x-64, endy);
+                        tiles.append( &mut self.son_of_krunch(data, bytes_per_row, startx, y, x, endy)); // should this actuall end at x+64?
+                    }
+                    //
+                    return tiles;
+                } else if (region_type == RegionType::Similarity) && !identical {
+                    // End of a region of similarity: (1) discard everything above the current
+                    // row which is unchanged
+                    // (2) search the region to the left below the current row (as everything
+                    // immediately left is unchanged)
+                    if x > startx {
+                        tiles.append( &mut self.son_of_krunch(data, bytes_per_row, startx, y + 16, x, endy));
+                    }
+                    // (3) search the region to the right on the current row
+                    tiles.append( &mut self.son_of_krunch(data, bytes_per_row, x, y, endx, endy));
+                    return tiles;
+                } else if region_type == RegionType::Difference && x == endx && y == endy {
+                    tiles.push( Bigtile::from_image(&data, bytes_per_row, startx, starty, endx, endy));
+                    return tiles;
+                }
+            }
+        }
 
         tiles
     }
