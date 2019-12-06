@@ -107,7 +107,6 @@ impl Snapper {
         // start splitting the regions horizontally
         //tiles.append( &mut self.split_h(&pixels, bytes_per_row as i32, 0, 0, bytes_per_row as i32, self.height as i32) );
         tiles.append( &mut self.son_of_krunch(&pixels, bytes_per_row as i32, 0, 0, bytes_per_row as i32, self.height as i32) );
-        println!("done krunching");
         self.last = pixels.clone();
         debug!("tiling took {} ms", now.elapsed().as_millis());
 
@@ -116,9 +115,9 @@ impl Snapper {
 
     // attempt at an O(n) split algorithm
     fn son_of_krunch(&mut self, data: &Vec<u8>, bytes_per_row: i32, startx: i32, starty: i32, endx: i32, endy: i32) -> Vec<Bigtile> {
-        println!("Invoked with sx {}, sy {}, ex {}, ey {}", startx, starty, endx, endy);
         let mut tiles = Vec::<Bigtile>::new();
         let mut region_type = RegionType::Unknown;
+        let now = std::time::Instant::now();
 
         for y in (starty..endy).step_by(16) { // define a 16px x 16px (or less at the edges) tile.
             for x in (startx .. endx).step_by(64) { // 16 px X 4 channel RGBA
@@ -139,23 +138,20 @@ impl Snapper {
                         false => RegionType::Difference,
                     };
                 } else if (region_type == RegionType::Difference) && identical {
-                    println!("Run of differences ended @ {}, {} when searching {}, {} to {}, {}", x, y, startx, starty, endx, endy);
                     // End of a region of difference: send everything above the current row
-                    if(y-16 > starty) {
-                        println!("bigtiling sx {}, sy {}, ex {}, ey {}", startx, starty, endx, y-16);
-                        tiles.push( Bigtile::from_image(&data, bytes_per_row, startx, starty, endx, y-16));
+                    if(y > starty) {
+                        tiles.push( Bigtile::from_image(&data, bytes_per_row, startx, starty, endx, y));
                     }
 
                     // (2) search the region to the right from the current row
-                    //println!("right side will be {}, {} to {}, {}", x, y, endx, endy);
                     tiles.append( &mut self.son_of_krunch(data, bytes_per_row, x, y, endx, endy));
 
                     // (3) search the region to the left on the current row
-                    if x-64 > startx {
-                        //println!("left side will be {}, {} to {}, {}", startx, y, x-64, endy);
+                    if x > startx {
                         tiles.append( &mut self.son_of_krunch(data, bytes_per_row, startx, y, x, endy)); // should this actuall end at x+64?
                     }
                     //
+                    println!("(A)son of krunch took {} ms", now.elapsed().as_millis());
                     return tiles;
                 } else if (region_type == RegionType::Similarity) && !identical {
                     // End of a region of similarity: (1) discard everything above the current
@@ -167,9 +163,11 @@ impl Snapper {
                     }
                     // (3) search the region to the right on the current row
                     tiles.append( &mut self.son_of_krunch(data, bytes_per_row, x, y, endx, endy));
+                    println!("(B)son of krunch took {} ms", now.elapsed().as_millis());
                     return tiles;
                 } else if region_type == RegionType::Difference && x == endx && y == endy {
                     tiles.push( Bigtile::from_image(&data, bytes_per_row, startx, starty, endx, endy));
+                    println!("(C)son of krunch took {} ms", now.elapsed().as_millis());
                     return tiles;
                 }
             }
